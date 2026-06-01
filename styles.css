@@ -1,0 +1,6 @@
+/* Styling for misspelled words */
+.sxjeel-misspelled {
+    text-decoration-line: underline;
+    text-decoration-style: wavy;
+    text-decoration-color: var(--color-red);
+}
