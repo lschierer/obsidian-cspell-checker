@@ -14,10 +14,38 @@ const DEFAULT_SETTINGS: SpellCheckerSettings = {
 
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
 
+// Fast Levenshtein distance calculation for fuzzy matching
+function getEditDistance(a: string, b: string): number {
+    if (a.length === 0) return b.length;
+    if (b.length === 0) return a.length;
+
+    const matrix = [];
+    for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+    for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+    for (let i = 1; i <= b.length; i++) {
+        for (let j = 1; j <= a.length; j++) {
+            if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                matrix[i][j] = matrix[i - 1][j - 1];
+            } else {
+                matrix[i][j] = Math.min(
+                    matrix[i - 1][j - 1] + 1, // substitution
+                    Math.min(
+                        matrix[i][j - 1] + 1, // insertion
+                        matrix[i - 1][j] + 1  // deletion
+                    )
+                );
+            }
+        }
+    }
+    return matrix[b.length][a.length];
+}
+
 export default class OfflineSpellChecker extends Plugin {
     settings: SpellCheckerSettings;
     spellcheckers: any[] = [];
     loadedDictNames: string[] = [];
+    masterVocabulary: string[] = []; // Holds clean word lists for high speed fallback matching
     pluginExt: Extension;
 
     async onload() {
@@ -25,7 +53,7 @@ export default class OfflineSpellChecker extends Plugin {
         await this.initDictionaryFiles();
         await this.loadAllDictionaries();
 
-        // 1. CodeMirror Extension for low-resource live highlighting
+        // 1. CodeMirror Extension for low resource live highlighting
         this.pluginExt = ViewPlugin.fromClass(
             class {
                 decorations: DecorationSet;
@@ -72,24 +100,19 @@ export default class OfflineSpellChecker extends Plugin {
         (window as any).sxjeelSpellCheckerPluginInstance = this;
         this.registerEditorExtension(this.pluginExt);
 
-        // 2. Right-Click Context Menu (UPDATED FOR MODERN OBSIDIAN ENGINE)
+        // 2. Right Click Context Menu 
         this.registerEvent(
             this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, view: MarkdownView) => {
                 if (!this.settings.isEnabled || this.spellcheckers.length === 0) return;
 
                 const cursor = editor.getCursor();
                 const cm = (editor as any).cm;
-                
-                // Ensure the modern CodeMirror instance is active
                 if (!cm || !cm.state) return;
 
-                // Find the exact boundaries of the word under the cursor
                 const pos = editor.posToOffset(cursor);
                 const wordRange = cm.state.wordAt(pos);
-                
                 if (!wordRange) return;
 
-                // Extract the clean word and its exact positions
                 const word = cm.state.doc.sliceString(wordRange.from, wordRange.to);
                 const fromPos = editor.offsetToPos(wordRange.from);
                 const toPos = editor.offsetToPos(wordRange.to);
@@ -100,13 +123,30 @@ export default class OfflineSpellChecker extends Plugin {
                     if (!isCorrect) {
                         menu.addSeparator();
 
-                        // Collect suggestions from ALL loaded dictionaries
                         let allSuggestions: string[] = [];
                         this.spellcheckers.forEach(sp => {
                             allSuggestions.push(...sp.suggest(word));
                         });
 
-                        // Remove duplicates and keep only the top 5
+                        // FALLBACK FUZZY ENGINE: If native engine returns poor options or nothing, use Levenshtein calculation
+                        if (allSuggestions.length < 3 && this.masterVocabulary.length > 0) {
+                            const lowerWord = word.toLowerCase();
+                            // Filter candidates of similar length to optimize lookup time down to milliseconds
+                            const candidates = this.masterVocabulary.filter(w => Math.abs(w.length - lowerWord.length) <= 1);
+                            
+                            let fuzzyMatches: { word: string, score: number }[] = [];
+                            for (const cand of candidates) {
+                                const dist = getEditDistance(lowerWord, cand);
+                                if (dist <= 2) { // Max 2 edits allowed
+                                    fuzzyMatches.push({ word: cand, score: dist });
+                                }
+                            }
+                            // Sort by closest match and pull top entries
+                            fuzzyMatches.sort((a, b) => a.score - b.score);
+                            const topFuzzy = fuzzyMatches.map(m => m.word);
+                            allSuggestions.push(...topFuzzy);
+                        }
+
                         const uniqueSuggestions = [...new Set(allSuggestions)].slice(0, 5);
 
                         if (uniqueSuggestions.length === 0) {
@@ -119,7 +159,6 @@ export default class OfflineSpellChecker extends Plugin {
                                     item.setTitle(`Suggest: ${suggestion}`)
                                         .setIcon('check')
                                         .onClick(() => {
-                                            // Replaces the exact bounds of the word
                                             editor.replaceRange(suggestion, fromPos, toPos);
                                         });
                                 });
@@ -174,6 +213,7 @@ export default class OfflineSpellChecker extends Plugin {
     async loadAllDictionaries() {
         this.spellcheckers = [];
         this.loadedDictNames = [];
+        this.masterVocabulary = [];
         
         if (!this.settings.isEnabled) return;
 
@@ -199,6 +239,17 @@ export default class OfflineSpellChecker extends Plugin {
                         const fileName = baseName.split('/').pop();
                         if (fileName) this.loadedDictNames.push(fileName);
 
+                        // Parse out Hunspell layout formatting to compile the fallback vocabulary array
+                        const lines = dicFile.split('\n');
+                        for (let line of lines) {
+                            line = line.trim();
+                            if (!line || /^\d+$/.test(line)) continue;
+                            const cleanWord = line.split('/')[0].toLowerCase();
+                            if (cleanWord.length > 1) {
+                                this.masterVocabulary.push(cleanWord);
+                            }
+                        }
+
                     } catch (err) {
                         console.error(`Failed to load dictionary: ${baseName}`, err);
                     }
@@ -210,12 +261,17 @@ export default class OfflineSpellChecker extends Plugin {
                 const personalWords = await adapter.read(personalDictPath);
                 if (personalWords) {
                     this.spellcheckers.forEach(sp => sp.personal(personalWords));
+                    
+                    const personalLines = personalWords.split('\n');
+                    for (let pWord of personalLines) {
+                        pWord = pWord.trim().toLowerCase();
+                        if (pWord) this.masterVocabulary.push(pWord);
+                    }
                 }
             }
 
-            if (this.loadedDictNames.length > 0) {
-                console.log(`Spell Checker Loaded: ${this.loadedDictNames.join(', ')}`);
-            }
+            // Remove internal duplicates from the fallback array
+            this.masterVocabulary = [...new Set(this.masterVocabulary)];
 
         } catch (e) {
             console.error("Error reading dictionaries folder", e);
@@ -234,6 +290,7 @@ export default class OfflineSpellChecker extends Plugin {
         await adapter.write(personalDictPath, newWords);
         
         this.spellcheckers.forEach(sp => sp.add(word)); 
+        this.masterVocabulary.push(word.toLowerCase());
     }
 }
 
@@ -263,13 +320,14 @@ class SpellCheckerSettingTab extends PluginSettingTab {
                         await this.plugin.loadAllDictionaries();
                     } else {
                         this.plugin.spellcheckers = [];
+                        this.plugin.masterVocabulary = [];
                     }
                     this.plugin.app.workspace.updateOptions();
                     this.display(); 
                 }));
 
         const loadedText = this.plugin.loadedDictNames.length > 0 
-            ? `Currently Loaded: ${this.plugin.loadedDictNames.join(', ')}` 
+            ? `Currently Loaded: ${this.plugin.loadedDictNames.join(', ')} (${this.plugin.masterVocabulary.length.toLocaleString()} words indexed for fallback matching)` 
             : `No dictionaries loaded.`;
 
         new Setting(containerEl)
