@@ -1,10 +1,12 @@
 # Offline Spell Checker for Obsidian
 
+![Example Preview](https://raw.githubusercontent.com/sajee05/sxjeel-spell-checker/main/example.png)
+
 ### The Problem
 
-I love taking notes in Obsidian, but finding a good way to check spelling was incredibly frustrating. Existing plugins like LanguageTool or Harper are amazingly powerful, but they are also very heavy and consume a lot of computational resources. They often feel like absolute overkill when all you want is a simple, seamless way to quickly catch and correct typos while you type.
+I love taking notes in Obsidian, but finding a good way to check spelling was incredibly frustrating. Existing plugins like [LanguageTool Plugin by clemens e](https://github.com/clemens-e/obsidian-languagetool-plugin), [Harper](https://github.com/automattic/harper-obsidian-plugin), or [LanguageTool Integration by wrenger](https://github.com/wrenger/obsidian-languagetool) are amazingly powerful, but they are also very heavy and consume a lot of computational resources. They often feel like absolute overkill when all you want is a simple, seamless way to quickly catch and correct typos while you type.
 
-I just wanted a seamless auto spell checker that was completely offline, lightning fast, and would not drain my battery or slow down my vault with unnecessary bloat. Since I could not find one that fit my needs perfectly, I built it myself.
+I just wanted a seamless auto spell checker that was completely offline, lightning fast, and would not drain my battery or slow down my vault with unnecessary bloat. Since I could find no tool that fit my needs perfectly, I built it myself.
 
 ### The Solution
 
@@ -26,4 +28,3 @@ Here is what makes it different:
 5. Start typing!
 
 Enjoy a fast, private, and lightweight writing experience.
-
