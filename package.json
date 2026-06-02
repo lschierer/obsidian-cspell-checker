@@ -9,12 +9,14 @@
   },
   "author": "sxjeel",
   "dependencies": {
-    "nspell": "^2.1.5"
+    "cspell-lib": "^10.0.1"
   },
   "devDependencies": {
     "@codemirror/state": "^6.0.0",
     "@codemirror/view": "^6.0.0",
+    "@cspell/cspell-types": "^10.0.1",
     "@types/node": "^16.11.29",
+    "cspell-config-lib": "^10.0.1",
     "esbuild": "0.17.3",
     "obsidian": "latest",
     "tslib": "2.4.0",

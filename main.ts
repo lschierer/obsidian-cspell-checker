@@ -1,66 +1,42 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView, Menu, Editor, FileSystemAdapter } from 'obsidian';
 import { RangeSetBuilder, Extension } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
-// @ts-ignore
-import nspell from 'nspell';
+import { getDictionary, getDefaultConfigLoader, readSettings } from 'cspell-lib';
+import type { SpellingDictionaryCollection } from 'cspell-lib';
+import { pathToFileURL } from 'url';
+import * as path from 'path';
+import * as fs from 'fs/promises';
 
-interface SpellCheckerSettings {
+interface CSpellCheckerSettings {
     isEnabled: boolean;
 }
 
-const DEFAULT_SETTINGS: SpellCheckerSettings = {
+const DEFAULT_SETTINGS: CSpellCheckerSettings = {
     isEnabled: true,
-}
+};
 
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
 
-// Fast Levenshtein distance calculation for fuzzy matching
-function getEditDistance(a: string, b: string): number {
-    if (a.length === 0) return b.length;
-    if (b.length === 0) return a.length;
-
-    const matrix = [];
-    for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-    for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-
-    for (let i = 1; i <= b.length; i++) {
-        for (let j = 1; j <= a.length; j++) {
-            if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                matrix[i][j] = matrix[i - 1][j - 1];
-            } else {
-                matrix[i][j] = Math.min(
-                    matrix[i - 1][j - 1] + 1, // substitution
-                    Math.min(
-                        matrix[i][j - 1] + 1, // insertion
-                        matrix[i - 1][j] + 1  // deletion
-                    )
-                );
-            }
-        }
-    }
-    return matrix[b.length][a.length];
-}
-
-export default class OfflineSpellChecker extends Plugin {
-    settings: SpellCheckerSettings;
-    spellcheckers: any[] = [];
-    loadedDictNames: string[] = [];
-    masterVocabulary: string[] = []; // Holds clean word lists for high speed fallback matching
+export default class CSpellCheckerPlugin extends Plugin {
+    settings: CSpellCheckerSettings;
+    dictionary: SpellingDictionaryCollection | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cspellSettings: any = null;
+    configFilePath: string | null = null;
+    addWordsDictPath: string | null = null;
     pluginExt: Extension;
 
     async onload() {
         await this.loadSettings();
-        await this.initDictionaryFiles();
-        await this.loadAllDictionaries();
+        await this.loadCSpellConfig();
 
-        // 1. CodeMirror Extension for low resource live highlighting
         this.pluginExt = ViewPlugin.fromClass(
             class {
                 decorations: DecorationSet;
-                plugin: OfflineSpellChecker;
+                plugin: CSpellCheckerPlugin;
 
                 constructor(view: EditorView) {
-                    this.plugin = (window as any).sxjeelSpellCheckerPluginInstance;
+                    this.plugin = (window as any).cspellCheckerPluginInstance;
                     this.decorations = this.buildDecorations(view);
                 }
 
@@ -72,22 +48,22 @@ export default class OfflineSpellChecker extends Plugin {
 
                 buildDecorations(view: EditorView): DecorationSet {
                     const builder = new RangeSetBuilder<Decoration>();
-                    if (!this.plugin || !this.plugin.settings.isEnabled || this.plugin.spellcheckers.length === 0) {
+                    if (!this.plugin?.settings.isEnabled || !this.plugin?.dictionary) {
                         return builder.finish();
                     }
 
                     const wordRegex = /\b[a-zA-Z']+\b/g;
-
                     for (const { from, to } of view.visibleRanges) {
                         const text = view.state.doc.sliceString(from, to);
                         let match;
                         while ((match = wordRegex.exec(text)) !== null) {
                             const word = match[0];
-                            if (word.length > 1) {
-                                const isCorrect = this.plugin.spellcheckers.some(sp => sp.correct(word));
-                                if (!isCorrect) {
-                                    builder.add(from + match.index, from + match.index + word.length, spellcheckDecoration);
-                                }
+                            if (word.length > 1 && !this.plugin.dictionary!.has(word)) {
+                                builder.add(
+                                    from + match.index,
+                                    from + match.index + word.length,
+                                    spellcheckDecoration
+                                );
                             }
                         }
                     }
@@ -97,94 +73,60 @@ export default class OfflineSpellChecker extends Plugin {
             { decorations: v => v.decorations }
         );
 
-        (window as any).sxjeelSpellCheckerPluginInstance = this;
+        (window as any).cspellCheckerPluginInstance = this;
         this.registerEditorExtension(this.pluginExt);
 
-        // 2. Right Click Context Menu 
         this.registerEvent(
             this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, view: MarkdownView) => {
-                if (!this.settings.isEnabled || this.spellcheckers.length === 0) return;
+                if (!this.settings.isEnabled || !this.dictionary) return;
 
                 const cursor = editor.getCursor();
                 const cm = (editor as any).cm;
-                if (!cm || !cm.state) return;
+                if (!cm?.state) return;
 
                 const pos = editor.posToOffset(cursor);
                 const wordRange = cm.state.wordAt(pos);
                 if (!wordRange) return;
 
                 const word = cm.state.doc.sliceString(wordRange.from, wordRange.to);
+                if (word.length <= 1 || this.dictionary.has(word)) return;
+
                 const fromPos = editor.offsetToPos(wordRange.from);
                 const toPos = editor.offsetToPos(wordRange.to);
 
-                if (word.length > 1) {
-                    const isCorrect = this.spellcheckers.some(sp => sp.correct(word));
-                    
-                    if (!isCorrect) {
-                        menu.addSeparator();
+                menu.addSeparator();
 
-                        let allSuggestions: string[] = [];
-                        this.spellcheckers.forEach(sp => {
-                            allSuggestions.push(...sp.suggest(word));
+                const suggestions = this.dictionary.suggest(word, { numSuggestions: 5 }).map((s: { word: string }) => s.word);
+                if (suggestions.length === 0) {
+                    menu.addItem(item => item.setTitle('No suggestions found').setDisabled(true));
+                } else {
+                    suggestions.forEach((suggestion: string) => {
+                        menu.addItem(item => {
+                            item.setTitle(`Suggest: ${suggestion}`)
+                                .setIcon('check')
+                                .onClick(() => editor.replaceRange(suggestion, fromPos, toPos));
                         });
-
-                        // FALLBACK FUZZY ENGINE: If native engine returns poor options or nothing, use Levenshtein calculation
-                        if (allSuggestions.length < 3 && this.masterVocabulary.length > 0) {
-                            const lowerWord = word.toLowerCase();
-                            // Filter candidates of similar length to optimize lookup time down to milliseconds
-                            const candidates = this.masterVocabulary.filter(w => Math.abs(w.length - lowerWord.length) <= 1);
-                            
-                            let fuzzyMatches: { word: string, score: number }[] = [];
-                            for (const cand of candidates) {
-                                const dist = getEditDistance(lowerWord, cand);
-                                if (dist <= 2) { // Max 2 edits allowed
-                                    fuzzyMatches.push({ word: cand, score: dist });
-                                }
-                            }
-                            // Sort by closest match and pull top entries
-                            fuzzyMatches.sort((a, b) => a.score - b.score);
-                            const topFuzzy = fuzzyMatches.map(m => m.word);
-                            allSuggestions.push(...topFuzzy);
-                        }
-
-                        const uniqueSuggestions = [...new Set(allSuggestions)].slice(0, 5);
-
-                        if (uniqueSuggestions.length === 0) {
-                            menu.addItem((item) => {
-                                item.setTitle("No suggestions found").setDisabled(true);
-                            });
-                        } else {
-                            uniqueSuggestions.forEach((suggestion: string) => {
-                                menu.addItem((item) => {
-                                    item.setTitle(`Suggest: ${suggestion}`)
-                                        .setIcon('check')
-                                        .onClick(() => {
-                                            editor.replaceRange(suggestion, fromPos, toPos);
-                                        });
-                                });
-                            });
-                        }
-
-                        menu.addSeparator();
-                        menu.addItem((item) => {
-                            item.setTitle(`Add "${word}" to dictionary`)
-                                .setIcon('plus-with-circle')
-                                .onClick(async () => {
-                                    await this.addToPersonalDictionary(word);
-                                    new Notice(`Added "${word}" to dictionary`);
-                                    view.editor.focus();
-                                });
-                        });
-                    }
+                    });
                 }
+
+                menu.addSeparator();
+                menu.addItem(item => {
+                    item.setTitle(`Add "${word}" to dictionary`)
+                        .setIcon('plus-with-circle')
+                        .onClick(async () => {
+                            await this.addToPersonalDictionary(word);
+                            new Notice(`Added "${word}" to dictionary`);
+                            view.editor.focus();
+                        });
+                });
             })
         );
 
-        this.addSettingTab(new SpellCheckerSettingTab(this.app, this));
+        this.addSettingTab(new CSpellCheckerSettingTab(this.app, this));
     }
 
     onunload() {
-        delete (window as any).sxjeelSpellCheckerPluginInstance;
+        delete (window as any).cspellCheckerPluginInstance;
     }
 
     async loadSettings() {
@@ -193,111 +135,67 @@ export default class OfflineSpellChecker extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
-        (this.app.workspace as any).updateOptions?.(); 
     }
 
-    async initDictionaryFiles() {
-        const adapter = this.app.vault.adapter;
-        const dictDir = `${this.manifest.dir}/dicts`;
-        
-        if (!(await adapter.exists(dictDir))) {
-            await adapter.mkdir(dictDir);
-        }
+    async loadCSpellConfig() {
+        this.dictionary = null;
+        this.cspellSettings = null;
+        this.configFilePath = null;
+        this.addWordsDictPath = null;
 
-        const personalDictPath = `${dictDir}/personal.txt`;
-        if (!(await adapter.exists(personalDictPath))) {
-            await adapter.write(personalDictPath, "");
-        }
-    }
-
-    async loadAllDictionaries() {
-        this.spellcheckers = [];
-        this.loadedDictNames = [];
-        this.masterVocabulary = [];
-        
         if (!this.settings.isEnabled) return;
 
         const adapter = this.app.vault.adapter;
-        const dictDir = `${this.manifest.dir}/dicts`;
+        if (!(adapter instanceof FileSystemAdapter)) return;
+
+        const vaultPath = adapter.getBasePath();
 
         try {
-            const files = await adapter.list(dictDir);
-            const affFiles = files.files.filter(f => f.endsWith('.aff'));
+            const loader = getDefaultConfigLoader();
+            // searchForConfigFileLocation walks up parent dirs to find cspell.json
+            const configURL = await loader.searchForConfigFileLocation(pathToFileURL(vaultPath + '/'));
+            if (!configURL) return;
 
-            for (const affPath of affFiles) {
-                const baseName = affPath.replace('.aff', '');
-                const dicPath = `${baseName}.dic`;
+            const configFilePath = configURL.pathname;
+            this.configFilePath = configFilePath;
+            const settings = await readSettings(configURL);
+            this.cspellSettings = settings;
 
-                if (files.files.includes(dicPath)) {
-                    try {
-                        const affFile = await adapter.read(affPath);
-                        const dicFile = await adapter.read(dicPath);
-                        
-                        const sp = nspell(affFile, dicFile);
-                        this.spellcheckers.push(sp);
-                        
-                        const fileName = baseName.split('/').pop();
-                        if (fileName) this.loadedDictNames.push(fileName);
-
-                        // Parse out Hunspell layout formatting to compile the fallback vocabulary array
-                        const lines = dicFile.split('\n');
-                        for (let line of lines) {
-                            line = line.trim();
-                            if (!line || /^\d+$/.test(line)) continue;
-                            const cleanWord = line.split('/')[0].toLowerCase();
-                            if (cleanWord.length > 1) {
-                                this.masterVocabulary.push(cleanWord);
-                            }
-                        }
-
-                    } catch (err) {
-                        console.error(`Failed to load dictionary: ${baseName}`, err);
-                    }
-                }
+            // Find which dictionary definition is marked as the write target
+            const configDir = path.dirname(configFilePath);
+            const defs: any[] = settings.dictionaryDefinitions ?? [];
+            const addWordsDef = defs.find((d: any) => d.addWords && d.path);
+            if (addWordsDef) {
+                this.addWordsDictPath = path.resolve(configDir, addWordsDef.path);
             }
 
-            const personalDictPath = `${dictDir}/personal.txt`;
-            if (await adapter.exists(personalDictPath)) {
-                const personalWords = await adapter.read(personalDictPath);
-                if (personalWords) {
-                    this.spellcheckers.forEach(sp => sp.personal(personalWords));
-                    
-                    const personalLines = personalWords.split('\n');
-                    for (let pWord of personalLines) {
-                        pWord = pWord.trim().toLowerCase();
-                        if (pWord) this.masterVocabulary.push(pWord);
-                    }
-                }
-            }
-
-            // Remove internal duplicates from the fallback array
-            this.masterVocabulary = [...new Set(this.masterVocabulary)];
-
+            this.dictionary = await getDictionary(settings);
         } catch (e) {
-            console.error("Error reading dictionaries folder", e);
+            console.error('cspell-checker: failed to load config', e);
         }
     }
 
     async addToPersonalDictionary(word: string) {
-        if (this.spellcheckers.length === 0) return;
-        
-        const adapter = this.app.vault.adapter;
-        const personalDictPath = `${this.manifest.dir}/dicts/personal.txt`;
-        
-        const existingWords = await adapter.read(personalDictPath);
-        const newWords = existingWords ? `${existingWords}\n${word}` : word;
-        
-        await adapter.write(personalDictPath, newWords);
-        
-        this.spellcheckers.forEach(sp => sp.add(word)); 
-        this.masterVocabulary.push(word.toLowerCase());
+        if (!this.addWordsDictPath) {
+            new Notice('No writable dictionary configured — set addWords: true on a dictionaryDefinition in cspell.json.');
+            return;
+        }
+
+        const existing = await fs.readFile(this.addWordsDictPath, 'utf8');
+        const trimmed = existing.trimEnd();
+        await fs.writeFile(this.addWordsDictPath, trimmed + '\n' + word + '\n', 'utf8');
+
+        // Reload so the new word takes effect immediately in the current session
+        if (this.cspellSettings) {
+            this.dictionary = await getDictionary(this.cspellSettings);
+        }
     }
 }
 
-class SpellCheckerSettingTab extends PluginSettingTab {
-    plugin: OfflineSpellChecker;
+class CSpellCheckerSettingTab extends PluginSettingTab {
+    plugin: CSpellCheckerPlugin;
 
-    constructor(app: App, plugin: OfflineSpellChecker) {
+    constructor(app: App, plugin: CSpellCheckerPlugin) {
         super(app, plugin);
         this.plugin = plugin;
     }
@@ -306,55 +204,46 @@ class SpellCheckerSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
-        containerEl.createEl('h2', { text: 'Offline Spell Checker by sxjeel' });
+        containerEl.createEl('h2', { text: 'CSpell Checker' });
 
         new Setting(containerEl)
-            .setName('Enable Spell Checker')
-            .setDesc('Toggle offline spell checking.')
+            .setName('Enable spell checker')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.isEnabled)
-                .onChange(async (value) => {
+                .onChange(async value => {
                     this.plugin.settings.isEnabled = value;
                     await this.plugin.saveSettings();
-                    if (value) {
-                        await this.plugin.loadAllDictionaries();
-                    } else {
-                        this.plugin.spellcheckers = [];
-                        this.plugin.masterVocabulary = [];
-                    }
+                    await this.plugin.loadCSpellConfig();
                     this.plugin.app.workspace.updateOptions();
-                    this.display(); 
+                    this.display();
                 }));
 
-        const loadedText = this.plugin.loadedDictNames.length > 0 
-            ? `Currently Loaded: ${this.plugin.loadedDictNames.join(', ')} (${this.plugin.masterVocabulary.length.toLocaleString()} words indexed for fallback matching)` 
-            : `No dictionaries loaded.`;
+        const configLine = this.plugin.configFilePath
+            ? `Config: ${this.plugin.configFilePath}`
+            : 'No cspell.json found — place one in the vault or a parent directory.';
+
+        const dicts: string[] = this.plugin.cspellSettings?.dictionaries ?? [];
+        const dictLine = dicts.length ? `Dictionaries: ${dicts.join(', ')}` : 'No dictionaries loaded.';
+
+        const writeTarget = this.plugin.addWordsDictPath
+            ? `Write target: ${this.plugin.addWordsDictPath}`
+            : 'No addWords dictionary configured.';
 
         new Setting(containerEl)
-            .setName('Manage Dictionaries')
-            .setDesc(`Drop any .dic and .aff files here. ${loadedText}`)
+            .setName('Status')
+            .setDesc([configLine, dictLine, writeTarget].join('\n'));
+
+        new Setting(containerEl)
+            .setName('Reload dictionaries')
+            .setDesc('Re-scan for cspell.json and reload all dictionaries.')
             .addButton(btn => btn
-                .setButtonText('Open Folder')
-                .onClick(async () => {
-                    const adapter = this.plugin.app.vault.adapter;
-                    if (adapter instanceof FileSystemAdapter) {
-                        const fullPath = adapter.getFullPath(`${this.plugin.manifest.dir}/dicts`);
-                        try {
-                            const { shell } = require('electron');
-                            shell.openPath(fullPath);
-                        } catch (e) {
-                            new Notice("Opening the folder directly is only supported on the Desktop app.");
-                        }
-                    }
-                }))
-            .addButton(btn => btn
-                .setButtonText('Reload Files')
+                .setButtonText('Reload')
                 .setCta()
                 .onClick(async () => {
-                    await this.plugin.loadAllDictionaries();
+                    await this.plugin.loadCSpellConfig();
                     this.plugin.app.workspace.updateOptions();
-                    this.display(); 
-                    new Notice("Dictionaries reloaded!");
+                    this.display();
+                    new Notice('Dictionaries reloaded!');
                 }));
     }
 }

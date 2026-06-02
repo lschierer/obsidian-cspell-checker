@@ -1,9 +1,9 @@
 {
-  "id": "sxjeel-spell-checker",
-  "name": "Offline Spell Checker",
+  "id": "cspell-checker",
+  "name": "CSpell Checker",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "A fast, offline spell checker using standard .dic and .aff files.",
-  "author": "sxjeel",
-  "isDesktopOnly": false
+  "description": "Spell checking powered by cspell, reading your project's cspell.json config and dictionaries.",
+  "author": "Luke Schierer",
+  "isDesktopOnly": true
 }

@@ -24,9 +24,11 @@ esbuild.build({
 		"@lezer/common",
 		"@lezer/highlight",
 		"@lezer/lr",
-		...builtinModules], // Uses Node's native list directly
+		...builtinModules,
+		...builtinModules.map(m => `node:${m}`),
+	],
 	format: "cjs",
-	target: "es2018",
+	target: "es2020",
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
