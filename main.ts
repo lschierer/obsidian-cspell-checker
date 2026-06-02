@@ -1,11 +1,11 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView, Menu, Editor, FileSystemAdapter } from 'obsidian';
 import { RangeSetBuilder, Extension } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
-import { getDictionary, getDefaultConfigLoader, readSettings } from 'cspell-lib';
+import { getDictionary } from 'cspell-lib';
 import type { SpellingDictionaryCollection } from 'cspell-lib';
-import { pathToFileURL } from 'url';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { homedir } from 'os';
 
 interface CSpellCheckerSettings {
     isEnabled: boolean;
@@ -15,15 +15,105 @@ const DEFAULT_SETTINGS: CSpellCheckerSettings = {
     isEnabled: true,
 };
 
+const CONFIG_FILENAMES = ['cspell.json', '.cspell.json', 'cspell.config.json', 'cspell.yaml', 'cspell.yml'];
+
 const spellcheckDecoration = Decoration.mark({ class: "sxjeel-misspelled" });
+
+async function fileExists(p: string): Promise<boolean> {
+    try { await fs.access(p); return true; } catch { return false; }
+}
+
+async function findCspellConfig(startDir: string): Promise<string | null> {
+    let dir = startDir;
+    while (true) {
+        for (const name of CONFIG_FILENAMES) {
+            const candidate = path.join(dir, name);
+            if (await fileExists(candidate)) return candidate;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) return null;
+        dir = parent;
+    }
+}
+
+// Find the en_US trie file in the project's pnpm store or npm node_modules.
+// cspell-io reads trie files via plain fs.readFile given an absolute path,
+// which avoids the require()-based package resolution that breaks when bundled.
+async function findEnUsTrie(projectRoot: string): Promise<string | null> {
+    const pnpmStore = path.join(projectRoot, 'node_modules', '.pnpm');
+    try {
+        const dirs = await fs.readdir(pnpmStore);
+        for (const dir of dirs) {
+            const m = dir.match(/^@cspell\+(dict-en[_-]us)@/i);
+            if (!m) continue;
+            const pkgName = m[1]; // e.g. "dict-en_us"
+            const pkgDir = path.join(pnpmStore, dir, 'node_modules', '@cspell', pkgName);
+            for (const filename of ['en_US.trie.gz', 'en_US.trie', 'en-US.trie.gz']) {
+                const p = path.join(pkgDir, filename);
+                if (await fileExists(p)) return p;
+            }
+        }
+    } catch { /* no pnpm store */ }
+
+    // Flat npm/yarn install
+    for (const pkgName of ['dict-en_us', 'dict-en-us']) {
+        for (const filename of ['en_US.trie.gz', 'en_US.trie']) {
+            const p = path.join(projectRoot, 'node_modules', '@cspell', pkgName, filename);
+            if (await fileExists(p)) return p;
+        }
+    }
+
+    return null;
+}
+
+// Build a CSpellUserSettings-compatible object from the raw cspell.json.
+// All dictionary paths are resolved to absolute so cspell-io can read them
+// with fs.readFile without going through require() / package resolution.
+async function buildSettings(configFilePath: string, rawConfig: any): Promise<any> {
+    const projectRoot = path.dirname(configFilePath);
+    const resolvedDefs: any[] = [];
+
+    for (const def of (rawConfig.dictionaryDefinitions ?? []) as any[]) {
+        if (!def.path) {
+            resolvedDefs.push(def);
+            continue;
+        }
+        const expanded = (def.path as string).startsWith('~')
+            ? path.join(homedir(), (def.path as string).slice(1))
+            : def.path as string;
+        resolvedDefs.push({ ...def, path: path.resolve(projectRoot, expanded) });
+    }
+
+    // If en-us is requested but not explicitly defined, locate the trie
+    const dicts: string[] = rawConfig.dictionaries ?? [];
+    const enUsEntry = dicts.find(d => /^en[-_]?us$/i.test(d));
+    const hasEnUsDef = resolvedDefs.some(d => /^en[-_]?us$/i.test(d.name));
+
+    if (enUsEntry && !hasEnUsDef) {
+        const triePath = await findEnUsTrie(projectRoot);
+        if (triePath) {
+            resolvedDefs.push({ name: enUsEntry, path: triePath });
+        }
+    }
+
+    return {
+        version: '0.2',
+        language: rawConfig.language ?? 'en-US',
+        caseSensitive: rawConfig.caseSensitive ?? false,
+        dictionaries: dicts,
+        dictionaryDefinitions: resolvedDefs,
+        ignoreWords: rawConfig.ignoreWords,
+        words: rawConfig.words,
+    };
+}
 
 export default class CSpellCheckerPlugin extends Plugin {
     settings: CSpellCheckerSettings;
     dictionary: SpellingDictionaryCollection | null = null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    cspellSettings: any = null;
     configFilePath: string | null = null;
     addWordsDictPath: string | null = null;
+    configuredDictNames: string[] = [];
+    loadError: string | null = null;
     pluginExt: Extension;
 
     async onload() {
@@ -73,8 +163,12 @@ export default class CSpellCheckerPlugin extends Plugin {
             { decorations: v => v.decorations }
         );
 
+        // Suppress the native browser/OS spell checker so its "Add to dictionary"
+        // doesn't appear alongside ours in the context menu.
+        const disableNativeSpellcheck = EditorView.contentAttributes.of({ spellcheck: 'false' });
+
         (window as any).cspellCheckerPluginInstance = this;
-        this.registerEditorExtension(this.pluginExt);
+        this.registerEditorExtension([this.pluginExt, disableNativeSpellcheck]);
 
         this.registerEvent(
             this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, view: MarkdownView) => {
@@ -96,7 +190,9 @@ export default class CSpellCheckerPlugin extends Plugin {
 
                 menu.addSeparator();
 
-                const suggestions = this.dictionary.suggest(word, { numSuggestions: 5 }).map((s: { word: string }) => s.word);
+                const suggestions = this.dictionary.suggest(word, { numSuggestions: 5 })
+                    .map((s: { word: string }) => s.word);
+
                 if (suggestions.length === 0) {
                     menu.addItem(item => item.setTitle('No suggestions found').setDisabled(true));
                 } else {
@@ -139,9 +235,10 @@ export default class CSpellCheckerPlugin extends Plugin {
 
     async loadCSpellConfig() {
         this.dictionary = null;
-        this.cspellSettings = null;
         this.configFilePath = null;
         this.addWordsDictPath = null;
+        this.configuredDictNames = [];
+        this.loadError = null;
 
         if (!this.settings.isEnabled) return;
 
@@ -151,26 +248,36 @@ export default class CSpellCheckerPlugin extends Plugin {
         const vaultPath = adapter.getBasePath();
 
         try {
-            const loader = getDefaultConfigLoader();
-            // searchForConfigFileLocation walks up parent dirs to find cspell.json
-            const configURL = await loader.searchForConfigFileLocation(pathToFileURL(vaultPath + '/'));
-            if (!configURL) return;
-
-            const configFilePath = configURL.pathname;
+            const configFilePath = await findCspellConfig(vaultPath);
+            if (!configFilePath) {
+                this.loadError = 'No cspell.json found in vault or parent directories.';
+                return;
+            }
             this.configFilePath = configFilePath;
-            const settings = await readSettings(configURL);
-            this.cspellSettings = settings;
 
-            // Find which dictionary definition is marked as the write target
-            const configDir = path.dirname(configFilePath);
-            const defs: any[] = settings.dictionaryDefinitions ?? [];
-            const addWordsDef = defs.find((d: any) => d.addWords && d.path);
-            if (addWordsDef) {
-                this.addWordsDictPath = path.resolve(configDir, addWordsDef.path);
+            const rawConfig = JSON.parse(await fs.readFile(configFilePath, 'utf8'));
+            this.configuredDictNames = rawConfig.dictionaries ?? [];
+
+            // Find the first dictionary definition with addWords: true as the write target
+            const projectRoot = path.dirname(configFilePath);
+            for (const def of (rawConfig.dictionaryDefinitions ?? []) as any[]) {
+                if (!def.addWords || !def.path) continue;
+                const expanded = (def.path as string).startsWith('~')
+                    ? path.join(homedir(), (def.path as string).slice(1))
+                    : def.path as string;
+                this.addWordsDictPath = path.resolve(projectRoot, expanded);
+                break;
             }
 
-            this.dictionary = await getDictionary(settings);
+            const cspellSettings = await buildSettings(configFilePath, rawConfig);
+            this.dictionary = await getDictionary(cspellSettings);
+
+            const errors = this.dictionary.getErrors();
+            if (errors.length > 0) {
+                console.warn('cspell-checker: dict errors:', errors.map((e: Error) => e.message));
+            }
         } catch (e) {
+            this.loadError = String(e);
             console.error('cspell-checker: failed to load config', e);
         }
     }
@@ -182,12 +289,13 @@ export default class CSpellCheckerPlugin extends Plugin {
         }
 
         const existing = await fs.readFile(this.addWordsDictPath, 'utf8');
-        const trimmed = existing.trimEnd();
-        await fs.writeFile(this.addWordsDictPath, trimmed + '\n' + word + '\n', 'utf8');
+        await fs.writeFile(this.addWordsDictPath, existing.trimEnd() + '\n' + word + '\n', 'utf8');
 
-        // Reload so the new word takes effect immediately in the current session
-        if (this.cspellSettings) {
-            this.dictionary = await getDictionary(this.cspellSettings);
+        // Reload so the new word takes effect immediately
+        if (this.configFilePath) {
+            const rawConfig = JSON.parse(await fs.readFile(this.configFilePath, 'utf8'));
+            const cspellSettings = await buildSettings(this.configFilePath, rawConfig);
+            this.dictionary = await getDictionary(cspellSettings);
         }
     }
 }
@@ -220,18 +328,21 @@ class CSpellCheckerSettingTab extends PluginSettingTab {
 
         const configLine = this.plugin.configFilePath
             ? `Config: ${this.plugin.configFilePath}`
-            : 'No cspell.json found — place one in the vault or a parent directory.';
+            : 'No cspell.json found.';
 
-        const dicts: string[] = this.plugin.cspellSettings?.dictionaries ?? [];
+        const dicts = this.plugin.configuredDictNames;
         const dictLine = dicts.length ? `Dictionaries: ${dicts.join(', ')}` : 'No dictionaries loaded.';
 
         const writeTarget = this.plugin.addWordsDictPath
             ? `Write target: ${this.plugin.addWordsDictPath}`
             : 'No addWords dictionary configured.';
 
+        const lines = [configLine, dictLine, writeTarget];
+        if (this.plugin.loadError) lines.push(`Error: ${this.plugin.loadError}`);
+
         new Setting(containerEl)
             .setName('Status')
-            .setDesc([configLine, dictLine, writeTarget].join('\n'));
+            .setDesc(lines.join('\n'));
 
         new Setting(containerEl)
             .setName('Reload dictionaries')
