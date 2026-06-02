@@ -1,30 +1,60 @@
-# Offline Spell Checker for Obsidian
+# CSpell Checker for Obsidian
 
-![Example Preview](https://raw.githubusercontent.com/sajee05/sxjeel-spell-checker/main/example.png)
+An offline spell-checking plugin for Obsidian that uses [cspell-lib](https://github.com/streetsidesoftware/cspell) — the same engine behind the popular VS Code spell checker. It reads your project's existing `cspell.json` configuration, so dictionaries, custom word lists, and settings are shared across your editor tooling.
 
-### The Problem
+## Features
 
-I love taking notes in Obsidian, but finding a good way to check spelling was incredibly frustrating. Existing plugins like [LanguageTool Plugin by clemens e](https://github.com/clemens-e/obsidian-languagetool-plugin), [Harper](https://github.com/automattic/harper-obsidian-plugin), or [LanguageTool Integration by wrenger](https://github.com/wrenger/obsidian-languagetool) are amazingly powerful, but they are also very heavy and consume a lot of computational resources. They often feel like absolute overkill when all you want is a simple, seamless way to quickly catch and correct typos while you type.
+- **Uses your existing cspell.json** — walks up from the vault directory to find `cspell.json`, `.cspell.json`, `cspell.config.json`, `cspell.yaml`, or `cspell.yml`.
+- **Bundled dictionaries** — automatically locates the `@cspell/dict-en_us` trie from `node_modules` (pnpm or npm layouts).
+- **Custom dictionaries** — honors `dictionaryDefinitions` with file paths (absolute or relative, `~` expanded).
+- **Add to dictionary** — right-click a misspelled word to add it to whichever dictionary has `addWords: true`.
+- **Suggestions** — right-click for up to 5 spelling suggestions from cspell's suggestion engine.
+- **Viewport-only checking** — only processes visible text via CodeMirror 6 `visibleRanges`, keeping performance constant regardless of document size.
+- **Completely offline** — no network requests, no external APIs.
+- **Disables native spellcheck** — suppresses the browser/OS spell checker to avoid duplicate squiggles and conflicting context menus.
 
-I just wanted a seamless auto spell checker that was completely offline, lightning fast, and would not drain my battery or slow down my vault with unnecessary bloat. Since I could find no tool that fit my needs perfectly, I built it myself.
+## Requirements
 
-### The Solution
+- Obsidian (desktop only — uses Node.js `fs` and `path`)
+- A `cspell.json` config file somewhere in or above your vault directory
+- Dictionary packages installed in the project's `node_modules` (e.g. `@cspell/dict-en_us`)
 
-This plugin is built to be the exact opposite of those heavy grammar tools. It is a totally offline, deeply optimized spell checker that relies on standard open source dictionary files.
+## Installation
 
-Here is what makes it different:
+Copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsidian/plugins/cspell-checker/` directory, then enable "CSpell Checker" in Settings → Community Plugins.
 
-* **Zero Lag:** It is wired directly into the modern Obsidian text engine so it only checks the words currently visible on your screen. If you have a massive ten thousand word document open, the plugin completely ignores the text you are not actively looking at. This keeps your system resources completely free.
-* **Totally Offline:** Everything runs locally on your machine. No external APIs, no accounts, no server pings, and complete privacy.
-* **Seamless Corrections:** Just right click any word with a red squiggly line to instantly see the top five correct suggestions, and click to replace it.
-* **Personalized Vocabularies:** You can easily drop in standard dictionary files for English, or even build your own highly specific databases for things like UPSC preparation. Just click "Add to personal dictionary" on any custom word, and it will never be flagged again.
+If you're developing this plugin alongside the vault, use `mise run install` from this project directory (see mise.toml).
 
-### How to Use It
+## Configuration
 
-1. Enable the plugin in your Community Plugins settings.
-2. Go to the Offline Spell Checker settings tab and click the **Open Folder** button.
-3. Drop your preferred dictionary files (like English US or British English) into that folder. You need both the `.dic` and `.aff` files, which you can download for free from standard open source repositories.
-4. Click **Reload Files** in the settings.
-5. Start typing!
+The plugin reads configuration from your `cspell.json`. A minimal example:
 
-Enjoy a fast, private, and lightweight writing experience.
+```json
+{
+  "version": "0.2",
+  "language": "en-US",
+  "dictionaries": ["en-us", "project-words"],
+  "dictionaryDefinitions": [
+    {
+      "name": "project-words",
+      "path": "./.cspell/project-words.txt",
+      "addWords": true
+    }
+  ]
+}
+```
+
+## Settings
+
+- **Enable/disable** — toggle spell checking on and off
+- **Reload** — re-scan for `cspell.json` and reload all dictionaries after config changes
+
+## Building
+
+```sh
+mise run build
+```
+
+## License
+
+MIT

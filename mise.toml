@@ -1,3 +1,21 @@
 [tools]
 node = "lts"
 pnpm = "11.5"
+
+[tasks.build]
+description = "Build the plugin"
+run = "pnpm run build"
+
+[tasks.install]
+description = "Install plugin into Obsidian vault"
+depends = ["build"]
+usage = """
+flag "--location <location>" help="Location of the Obsidian Vault" default="./" env="OBSIDIAN_VAULT"
+"""
+run = """
+DEST="${usage_location}/.obsidian/plugins/cspell-checker"
+echo "Installing to '$DEST'"
+mkdir -p "$DEST"
+cp main.js manifest.json styles.css "$DEST/"
+echo "Installed to $DEST"
+"""

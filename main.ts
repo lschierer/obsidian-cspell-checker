@@ -1,7 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView, Menu, Editor, FileSystemAdapter } from 'obsidian';
 import { RangeSetBuilder, Extension } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
-import { getDictionary } from 'cspell-lib';
+import { getDictionary, clearCaches } from 'cspell-lib';
 import type { SpellingDictionaryCollection } from 'cspell-lib';
 import * as path from 'path';
 import * as fs from 'fs/promises';
@@ -114,6 +114,7 @@ export default class CSpellCheckerPlugin extends Plugin {
     addWordsDictPath: string | null = null;
     configuredDictNames: string[] = [];
     loadError: string | null = null;
+    dictVersion = 0;
     pluginExt: Extension;
 
     async onload() {
@@ -124,14 +125,18 @@ export default class CSpellCheckerPlugin extends Plugin {
             class {
                 decorations: DecorationSet;
                 plugin: CSpellCheckerPlugin;
+                lastDictVersion: number;
 
                 constructor(view: EditorView) {
                     this.plugin = (window as any).cspellCheckerPluginInstance;
+                    this.lastDictVersion = this.plugin?.dictVersion ?? 0;
                     this.decorations = this.buildDecorations(view);
                 }
 
                 update(update: ViewUpdate) {
-                    if (update.docChanged || update.viewportChanged) {
+                    const currentVersion = this.plugin?.dictVersion ?? 0;
+                    if (update.docChanged || update.viewportChanged || currentVersion !== this.lastDictVersion) {
+                        this.lastDictVersion = currentVersion;
                         this.decorations = this.buildDecorations(update.view);
                     }
                 }
@@ -212,6 +217,7 @@ export default class CSpellCheckerPlugin extends Plugin {
                         .onClick(async () => {
                             await this.addToPersonalDictionary(word);
                             new Notice(`Added "${word}" to dictionary`);
+                            this.refreshAllEditors();
                             view.editor.focus();
                         });
                 });
@@ -282,6 +288,17 @@ export default class CSpellCheckerPlugin extends Plugin {
         }
     }
 
+    refreshAllEditors() {
+        this.app.workspace.iterateAllLeaves(leaf => {
+            if (leaf.view instanceof MarkdownView) {
+                const cm = (leaf.view.editor as any).cm as EditorView | undefined;
+                if (cm) {
+                    cm.dispatch({});
+                }
+            }
+        });
+    }
+
     async addToPersonalDictionary(word: string) {
         if (!this.addWordsDictPath) {
             new Notice('No writable dictionary configured — set addWords: true on a dictionaryDefinition in cspell.json.');
@@ -293,9 +310,11 @@ export default class CSpellCheckerPlugin extends Plugin {
 
         // Reload so the new word takes effect immediately
         if (this.configFilePath) {
+            await clearCaches();
             const rawConfig = JSON.parse(await fs.readFile(this.configFilePath, 'utf8'));
             const cspellSettings = await buildSettings(this.configFilePath, rawConfig);
             this.dictionary = await getDictionary(cspellSettings);
+            this.dictVersion++;
         }
     }
 }
