@@ -23,6 +23,8 @@ An offline spell-checking plugin for Obsidian that uses [cspell-lib](https://git
 
 Copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsidian/plugins/cspell-checker/` directory, then enable "CSpell Checker" in Settings → Community Plugins.
 
+**Important:** Disable Obsidian's built-in spell checker (Settings → Editor → Spell check) to avoid duplicate/conflicting squiggles. This plugin replaces it with cspell-powered checking that respects your project's `cspell.json` configuration.
+
 If you're developing this plugin alongside the vault, use `mise run install` from this project directory (see mise.toml).
 
 ## Configuration

@@ -1,7 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, MarkdownView, Menu, Editor, FileSystemAdapter } from 'obsidian';
 import { RangeSetBuilder, Extension } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
-import { getDictionary, clearCaches } from 'cspell-lib';
+import { getDictionary, clearCachedFiles } from 'cspell-lib';
 import type { SpellingDictionaryCollection } from 'cspell-lib';
 import * as path from 'path';
 import * as fs from 'fs/promises';
@@ -116,6 +116,7 @@ export default class CSpellCheckerPlugin extends Plugin {
     loadError: string | null = null;
     dictVersion = 0;
     pluginExt: Extension;
+    private editorExtensions: Extension[] = [];
 
     async onload() {
         await this.loadSettings();
@@ -147,13 +148,18 @@ export default class CSpellCheckerPlugin extends Plugin {
                         return builder.finish();
                     }
 
+                    // Extract per-file ignore words from YAML frontmatter and inline directives
+                    const doc = view.state.doc;
+                    const fullText = doc.sliceString(0, Math.min(doc.length, 2000));
+                    const ignoreWords = this.extractIgnoreWords(fullText);
+
                     const wordRegex = /\b[a-zA-Z']+\b/g;
                     for (const { from, to } of view.visibleRanges) {
                         const text = view.state.doc.sliceString(from, to);
                         let match;
                         while ((match = wordRegex.exec(text)) !== null) {
                             const word = match[0];
-                            if (word.length > 1 && !this.plugin.dictionary!.has(word)) {
+                            if (word.length > 1 && !ignoreWords.has(word) && !this.plugin.dictionary!.has(word)) {
                                 builder.add(
                                     from + match.index,
                                     from + match.index + word.length,
@@ -164,6 +170,46 @@ export default class CSpellCheckerPlugin extends Plugin {
                     }
                     return builder.finish();
                 }
+
+                extractIgnoreWords(text: string): Set<string> {
+                    const words = new Set<string>();
+
+                    // Parse YAML frontmatter: cspell.ignore array or cspell.words array
+                    const fmMatch = text.match(/^---\n([\s\S]*?)\n---/);
+                    if (fmMatch) {
+                        const fm = fmMatch[1];
+                        // Match "cspell:" block with "ignore:" or "words:" list
+                        const cspellMatch = fm.match(/^cspell:\s*\n((?:[ \t]+.*\n?)*)/m);
+                        if (cspellMatch) {
+                            const block = cspellMatch[1];
+                            // Extract words from "ignore:" or "words:" lists
+                            const listMatch = block.match(/(?:ignore|words):\s*\n((?:\s*-\s+.*\n?)*)/);
+                            if (listMatch) {
+                                for (const m of listMatch[1].matchAll(/^\s*-\s+(.+)/gm)) {
+                                    for (const w of m[1].trim().split(/[\s,]+/)) {
+                                        if (w) words.add(w);
+                                    }
+                                }
+                            }
+                        }
+                        // Also support flat: "cspell: ignore: word1 word2"
+                        const flatMatch = fm.match(/^cspell:\s+ignore:\s+(.+)/m);
+                        if (flatMatch) {
+                            for (const w of flatMatch[1].trim().split(/[\s,]+/)) {
+                                if (w) words.add(w);
+                            }
+                        }
+                    }
+
+                    // Also support inline cspell directives anywhere in the scanned text
+                    for (const m of text.matchAll(/<!--\s*cspell:\s*ignore[: ]\s*(.+?)-->/gi)) {
+                        for (const w of m[1].trim().split(/[\s,]+/)) {
+                            if (w) words.add(w);
+                        }
+                    }
+
+                    return words;
+                }
             },
             { decorations: v => v.decorations }
         );
@@ -173,7 +219,9 @@ export default class CSpellCheckerPlugin extends Plugin {
         const disableNativeSpellcheck = EditorView.contentAttributes.of({ spellcheck: 'false' });
 
         (window as any).cspellCheckerPluginInstance = this;
-        this.registerEditorExtension([this.pluginExt, disableNativeSpellcheck]);
+        this.editorExtensions.push(this.pluginExt, disableNativeSpellcheck);
+        this.registerEditorExtension(this.editorExtensions);
+        this.app.workspace.updateOptions();
 
         this.registerEvent(
             this.app.workspace.on('editor-menu', (menu: Menu, editor: Editor, view: MarkdownView) => {
@@ -310,7 +358,7 @@ export default class CSpellCheckerPlugin extends Plugin {
 
         // Reload so the new word takes effect immediately
         if (this.configFilePath) {
-            await clearCaches();
+            await clearCachedFiles();
             const rawConfig = JSON.parse(await fs.readFile(this.configFilePath, 'utf8'));
             const cspellSettings = await buildSettings(this.configFilePath, rawConfig);
             this.dictionary = await getDictionary(cspellSettings);
